@@ -1,12 +1,89 @@
 #!/system/bin/sh
 
 MODDIR=${0%/*}
+FAKE_CPUINFO="$MODDIR/cpuinfo"
 
-# 清理旧挂载（如果有）
+cat > $FAKE_CPUINFO <<EOF
+Processor	: AArch64 Processor rev 0 (aarch64)
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x1
+CPU part	: 0xd0c
+CPU revision	: 0
+
+processor	: 0
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x1
+CPU part	: 0xd0c
+CPU revision	: 0
+
+processor	: 1
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x2
+CPU part	: 0xd0a
+CPU revision	: 0
+
+processor	: 2
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x2
+CPU part	: 0xd0a
+CPU revision	: 0
+
+processor	: 3
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x2
+CPU part	: 0xd0a
+CPU revision	: 0
+
+processor	: 4
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0b
+CPU revision	: 0
+
+processor	: 5
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0b
+CPU revision	: 0
+
+processor	: 6
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0b
+CPU revision	: 0
+
+processor	: 7
+BogoMIPS	: 26.00
+CPU implementer	: 0x48
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0b
+CPU revision	: 0
+
+Hardware	: HiSilicon Kirin 9000S
+EOF
+
+chmod 644 $FAKE_CPUINFO
+mkdir -p $MODDIR/running_state
+chmod 755 $MODDIR/running_state
+
+# 清理旧挂载
 umount /proc/cpuinfo 2>/dev/null
-
-# 这个模块不需要生成 fake 文件，因为改用 hook 方式
-# 但保留目录结构以兼容旧版
-touch $MODDIR/cpuinfo
 
 exit 0
