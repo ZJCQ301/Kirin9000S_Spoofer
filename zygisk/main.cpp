@@ -4,8 +4,11 @@
 #include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <android/log.h>
 #include <cstring>
+#include <cstdio>
+#include <cerrno>
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Kirin9000S", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "Kirin9000S", __VA_ARGS__)
@@ -15,8 +18,8 @@ using namespace zygisk;
 static unsigned long (*orig_getauxval)(unsigned long) = nullptr;
 
 static unsigned long fake_getauxval(unsigned long type) {
-    if (type == 16) return 0x7efefeff;   // AT_HWCAP 麒麟特征
-    if (type == 26) return 0x0000001f;   // AT_HWCAP2
+    if (type == 16) return 0x7efefeff;
+    if (type == 26) return 0x0000001f;
     return orig_getauxval ? orig_getauxval(type) : 0;
 }
 
@@ -39,8 +42,6 @@ public:
         if (strcmp(process, "com.tencent.tmgp.dfm") == 0) {
             is_target = true;
             LOGD("*** TARGET DETECTED: %s ***", process);
-            
-            // 尝试挂载（在 zygote 阶段）
             do_mount();
         }
     }
@@ -52,15 +53,11 @@ public:
         if (!is_target) return;
         
         LOGD("*** POST SPECIALIZE: remounting for %s ***", process);
-        
-        // 再次挂载，确保对应用进程生效（关键！）
         do_mount();
         
-        // Hook getauxval（防止 HWCAP 泄露）
         api->pltHookRegister(".*libc\\.so$", "getauxval", (void*)fake_getauxval, (void**)&orig_getauxval);
         api->pltHookCommit();
         
-        // 验证挂载是否成功
         verify_mount();
     }
 
@@ -74,17 +71,14 @@ private:
             return;
         }
         
-        // 先尝试强制卸载已有挂载
         umount2("/proc/cpuinfo", MNT_DETACH);
         
-        // 绑定挂载
         if (mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
             LOGD("[+] Mount success: %s -> /proc/cpuinfo", fake_cpuinfo);
         } else {
-            LOGE("[-] Mount failed: %s", strerror(errno));
+            LOGE("[-] Mount failed");
         }
         
-        // 额外挂载 midr_el1（如果存在）
         char fake_midr[256];
         snprintf(fake_midr, sizeof(fake_midr), "%s/midr_el1", module_path);
         const char* midr_target = "/sys/devices/system/cpu/cpu0/regs/identification/midr_el1";
@@ -114,7 +108,6 @@ private:
             LOGD("*** VERIFICATION: /proc/cpuinfo shows Kirin 9000S ✅ ***");
         } else {
             LOGE("*** VERIFICATION: /proc/cpuinfo is NOT spoofed ❌ ***");
-            // 再次尝试挂载
             do_mount();
         }
     }
