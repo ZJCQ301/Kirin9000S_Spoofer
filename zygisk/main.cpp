@@ -12,79 +12,79 @@
 
 using namespace zygisk;
 
-struct AppSpecializeArgs {
-    void* placeholder[8];
-};
-
 class KirinSpoofModule : public ModuleBase {
 public:
     void onLoad(void* api, JNIEnv* env) override {
-        LOGD("Module loaded");
+        LOGD("Module loaded successfully");
     }
 
     void preAppSpecialize(void* args) override {
         const char* process = get_process_name();
         LOGD("Process: %s", process);
         
-        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) return;
+        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) {
+            LOGD("Not target, skipping");
+            return;
+        }
         
-        LOGD("Target detected! Spoofing CPU info...");
+        LOGD("=== Target detected! Spoofing CPU info ===");
         
         // 挂载伪造的 cpuinfo
-        mount_fake_files();
-        
-        // Hook getauxval
-        hook_getauxval();
+        if (mount_fake_files()) {
+            LOGD("CPU info spoofed successfully!");
+        } else {
+            LOGE("Failed to spoof CPU info");
+        }
     }
 
 private:
     const char* get_process_name() {
-        FILE* fp = fopen("/proc/self/cmdline", "r");
-        if (!fp) return "unknown";
         static char cmdline[256];
-        fgets(cmdline, sizeof(cmdline), fp);
-        fclose(fp);
-        return cmdline;
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return "unknown";
+        int len = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        if (len > 0) {
+            cmdline[len] = '\0';
+            return cmdline;
+        }
+        return "unknown";
     }
 
-    void mount_fake_files() {
-        const char* fake_cpuinfo = "/data/adb/modules/kirin9000s_spoofer/cpuinfo";
-        const char* fake_midr = "/data/adb/modules/kirin9000s_spoofer/midr_el1";
+    bool mount_fake_files() {
+        bool success = false;
         
-        if (access(fake_cpuinfo, F_OK) == 0) {
-            if (mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
-                LOGD("Successfully mounted fake cpuinfo");
-            } else {
-                LOGE("Failed to mount cpuinfo");
-            }
+        // 模块安装路径
+        const char* module_path = "/data/adb/modules/kirin9000s_spoofer";
+        char fake_cpuinfo[256];
+        snprintf(fake_cpuinfo, sizeof(fake_cpuinfo), "%s/cpuinfo", module_path);
+        
+        // 检查伪造文件是否存在
+        if (access(fake_cpuinfo, F_OK) != 0) {
+            LOGE("Fake cpuinfo not found: %s", fake_cpuinfo);
+            return false;
+        }
+        
+        // 挂载 /proc/cpuinfo
+        if (mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
+            LOGD("Successfully mounted fake cpuinfo");
+            success = true;
         } else {
-            LOGE("Fake cpuinfo file not found: %s", fake_cpuinfo);
+            LOGE("Failed to mount cpuinfo");
         }
         
+        // 尝试挂载 midr_el1（可选）
+        char fake_midr[256];
+        snprintf(fake_midr, sizeof(fake_midr), "%s/midr_el1", module_path);
         const char* midr_target = "/sys/devices/system/cpu/cpu0/regs/identification/midr_el1";
+        
         if (access(fake_midr, F_OK) == 0 && access(midr_target, F_OK) == 0) {
-            mount(fake_midr, midr_target, nullptr, MS_BIND, nullptr);
-            LOGD("Mounted fake midr_el1");
-        }
-    }
-
-    void hook_getauxval() {
-        void* libc = dlopen("libc.so", RTLD_LAZY);
-        if (!libc) {
-            LOGE("Cannot open libc.so");
-            return;
+            if (mount(fake_midr, midr_target, nullptr, MS_BIND, nullptr) == 0) {
+                LOGD("Successfully mounted fake midr_el1");
+            }
         }
         
-        // 获取原始函数地址
-        void* orig = dlsym(libc, "getauxval");
-        if (orig) {
-            LOGD("getauxval found at %p", orig);
-            // 这里简化处理：实际生产环境需要真正的 hook 框架
-            // 由于 Zygisk API 需要额外的头文件，先用日志代替
-        }
-        dlclose(libc);
-        
-        LOGD("getauxval hook setup complete (placeholder)");
+        return success;
     }
 };
 
