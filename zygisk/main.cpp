@@ -1,104 +1,124 @@
-#include "zygisk.hpp"
-#include <dlfcn.h>
+#include <zygisk.hpp>
+#include <android/log.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <android/log.h>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
+#include <cerrno>
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Kirin9000S", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "KirinSpoof", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "KirinSpoof", __VA_ARGS__)
 
-using namespace zygisk;
+using zygisk::Api;
+using zygisk::AppSpecializeArgs;
 
-// 完整的伪造 cpuinfo 内容（麒麟 9000S）
-static const char* FAKE_CPUINFO = 
-    "Processor\t: AArch64 Processor rev 0 (aarch64)\n"
-    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp\n"
-    "CPU implementer\t: 0x48\n"
-    "CPU architecture: 8\n"
-    "CPU variant\t: 0x1\n"
-    "CPU part\t: 0xd0c\n"
-    "CPU revision\t: 0\n"
-    "processor\t: 0\n"
-    "BogoMIPS\t: 26.00\n"
-    "CPU implementer\t: 0x48\n"
-    "CPU architecture: 8\n"
-    "CPU variant\t: 0x1\n"
-    "CPU part\t: 0xd0c\n"
-    "CPU revision\t: 0\n"
-    "Hardware\t: HiSilicon Kirin 9000S\n";
-
-static int (*orig_open)(const char*, int, mode_t) = nullptr;
-static FILE* (*orig_fopen)(const char*, const char*) = nullptr;
-static ssize_t (*orig_read)(int, void*, size_t) = nullptr;
-static size_t (*orig_fread)(void*, size_t, size_t, FILE*) = nullptr;
-static char* (*orig_fgets)(char*, int, FILE*) = nullptr;
-
-// 拦截 open：返回一个包含假数据的 pipe fd
-static int fake_open(const char* path, int flags, mode_t mode) {
-    if (path && strstr(path, "/proc/cpuinfo")) {
-        LOGD("Intercepted open(%s)", path);
-        int pipefd[2];
-        if (pipe(pipefd) == 0) {
-            write(pipefd[1], FAKE_CPUINFO, strlen(FAKE_CPUINFO));
-            close(pipefd[1]);
-            return pipefd[0];
-        }
-        return -1;
-    }
-    return orig_open(path, flags, mode);
-}
-
-// 拦截 fopen：返回一个内存流
-static FILE* fake_fopen(const char* path, const char* mode) {
-    if (path && strstr(path, "/proc/cpuinfo")) {
-        LOGD("Intercepted fopen(%s)", path);
-        return fmemopen((void*)FAKE_CPUINFO, strlen(FAKE_CPUINFO), "r");
-    }
-    return orig_fopen(path, mode);
-}
-
-// 可选：拦截 fgets / fread（防止一些应用直接读 FILE*）
-static char* fake_fgets(char* buf, int size, FILE* fp) {
-    // 不做额外处理，因为 fmemopen 已经能正常工作
-    return orig_fgets(buf, size, fp);
-}
-
-static size_t fake_fread(void* ptr, size_t size, size_t nmemb, FILE* fp) {
-    return orig_fread(ptr, size, nmemb, fp);
-}
-
-class KirinSpoofModule : public ModuleBase {
-private:
-    Api* api = nullptr;
-
+class KirinSpoofModule : public zygisk::ModuleBase {
 public:
-    void onLoad(Api* api, JNIEnv* env) override {
+    void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
-        LOGD("Kirin9000S Spoofer loaded (Zygisk Next Hook Mode)");
+        LOGD("Module loaded, registering companion");
+        // 注册 companion 入口点（关键！）
+        api->registerCompanion(reinterpret_cast<void*>(companion_entry));
     }
 
-    void preAppSpecialize(AppSpecializeArgs* args) override {
-        // Zygisk Next 下不在 pre 中做任何事
+    void preAppSpecialize(AppSpecializeArgs *args) override {
+        // 不做任何挂载，只用于可能需要的 hook
     }
 
-    void postAppSpecialize(const AppSpecializeArgs* args) override {
-        const char* process = api->getProcessName();
-        LOGD("postAppSpecialize: %s", process);
-        
-        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) return;
-        
-        LOGD("*** TARGET DETECTED: Installing hooks ***");
-        
-        // 注册 PLT hooks
-        api->pltHookRegister(".*libc\\.so$", "open", (void*)fake_open, (void**)&orig_open);
-        api->pltHookRegister(".*libc\\.so$", "fopen", (void*)fake_fopen, (void**)&orig_fopen);
-        api->pltHookRegister(".*libc\\.so$", "fgets", (void*)fake_fgets, (void**)&orig_fgets);
-        api->pltHookRegister(".*libc\\.so$", "fread", (void*)fake_fread, (void**)&orig_fread);
-        api->pltHookCommit();
-        
-        LOGD("*** Hooks installed for %s ***", process);
+    void postAppSpecialize(const AppSpecializeArgs *args) override {
+        // 也不做挂载，因为 companion 已经做了
+    }
+
+private:
+    Api *api = nullptr;
+
+    // 静态 companion 入口函数（独立进程执行）
+    static void companion_entry(void *arg) {
+        LOGD("Companion started");
+        int fd = *reinterpret_cast<int*>(arg);
+        LOGD("Companion fd = %d", fd);
+
+        // 读取指令（和隔壁模块一样）
+        char cmd;
+        if (read(fd, &cmd, 1) <= 0) {
+            LOGE("Failed to read command");
+            return;
+        }
+
+        if (cmd == 1) {
+            LOGD("Enter mount flow");
+            // 创建状态目录
+            mkdir("/data/adb/modules/kirin9000s_spoofer/running_state", 0755);
+            
+            // 读取实例计数
+            int instance_count = 0;
+            FILE *fp = fopen("/data/adb/modules/kirin9000s_spoofer/running_state/instance_count", "r");
+            if (fp) {
+                fscanf(fp, "%d", &instance_count);
+                fclose(fp);
+            }
+            LOGD("Current instance count = %d", instance_count);
+
+            if (instance_count == 0) {
+                // 执行挂载
+                const char *fake_file = "/data/adb/modules/kirin9000s_spoofer/cpuinfo";
+                if (access(fake_file, F_OK) == 0) {
+                    if (mount(fake_file, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
+                        LOGD("Mount success: %s -> /proc/cpuinfo", fake_file);
+                        // 创建 mounted 标记文件
+                        int mfd = open("/data/adb/modules/kirin9000s_spoofer/running_state/mounted", O_CREAT | O_WRONLY, 0644);
+                        if (mfd >= 0) close(mfd);
+                    } else {
+                        LOGE("Mount failed: %s", strerror(errno));
+                    }
+                } else {
+                    LOGE("Fake file not found: %s", fake_file);
+                }
+            } else {
+                LOGD("Fake cpuinfo already mounted, skip");
+            }
+
+            // 增加实例计数
+            instance_count++;
+            fp = fopen("/data/adb/modules/kirin9000s_spoofer/running_state/instance_count", "w");
+            if (fp) {
+                fprintf(fp, "%d", instance_count);
+                fclose(fp);
+            }
+            LOGD("New instance count = %d", instance_count);
+
+            // 等待卸载指令（保持进程运行）
+            while (read(fd, &cmd, 1) > 0) {
+                // 空循环，等待父进程关闭 fd
+            }
+            LOGD("Exit mount flow");
+
+            // 卸载流程
+            fp = fopen("/data/adb/modules/kirin9000s_spoofer/running_state/instance_count", "r");
+            int new_count = 0;
+            if (fp) {
+                fscanf(fp, "%d", &new_count);
+                fclose(fp);
+            }
+            LOGD("Current instance count before unload = %d", new_count);
+            
+            if (new_count <= 1) {
+                LOGD("Unmounting /proc/cpuinfo");
+                umount2("/proc/cpuinfo", MNT_DETACH);
+                unlink("/data/adb/modules/kirin9000s_spoofer/running_state/mounted");
+            }
+            new_count--;
+            fp = fopen("/data/adb/modules/kirin9000s_spoofer/running_state/instance_count", "w");
+            if (fp) {
+                fprintf(fp, "%d", new_count);
+                fclose(fp);
+            }
+            LOGD("Final instance count = %d", new_count);
+        }
+
+        LOGD("Companion exiting");
     }
 };
 
