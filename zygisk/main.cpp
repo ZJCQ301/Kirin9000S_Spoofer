@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 #include <android/log.h>
 #include <cstring>
 
@@ -13,148 +12,111 @@
 
 using namespace zygisk;
 
-static constexpr unsigned long FAKE_HWCAP  = 0x7efefeff;
-static constexpr unsigned long FAKE_HWCAP2 = 0x0000001f;
-
 static unsigned long (*orig_getauxval)(unsigned long) = nullptr;
-static int (*orig_system_property_get)(const char*, char*) = nullptr;
-
-static bool file_exists(const char* path) {
-    return access(path, F_OK) == 0;
-}
-
-static void bind_mount(const char* target, const char* source) {
-    if (mount(source, target, nullptr, MS_BIND, nullptr) == 0) {
-        LOGD("[+] Bind mount: %s -> %s", source, target);
-    } else {
-        LOGE("[-] Bind mount failed: %s -> %s", source, target);
-    }
-}
-
-static void fix_file_times(const char* path) {
-    struct timespec ts[2];
-    ts[0].tv_sec = 1600000000;
-    ts[1].tv_sec = 1600000000;
-    utimensat(AT_FDCWD, path, ts, 0);
-}
 
 static unsigned long fake_getauxval(unsigned long type) {
-    if (type == 16) return FAKE_HWCAP;
-    if (type == 26) return FAKE_HWCAP2;
+    if (type == 16) return 0x7efefeff;   // AT_HWCAP 麒麟特征
+    if (type == 26) return 0x0000001f;   // AT_HWCAP2
     return orig_getauxval ? orig_getauxval(type) : 0;
-}
-
-static int fake_system_property_get(const char *name, char *value) {
-    if (strcmp(name, "ro.board.platform") == 0) { strcpy(value, "kirin9000s"); return strlen(value); }
-    if (strcmp(name, "ro.hardware") == 0) { strcpy(value, "kirin9000s"); return strlen(value); }
-    if (strcmp(name, "ro.soc.model") == 0) { strcpy(value, "Kirin 9000S"); return strlen(value); }
-    if (strcmp(name, "ro.chipname") == 0) { strcpy(value, "Kirin 9000S"); return strlen(value); }
-    if (strcmp(name, "ro.product.board") == 0) { strcpy(value, "kirin9000s"); return strlen(value); }
-    if (strstr(name, "mediatek") != nullptr) { value[0] = 0; return 0; }
-    if (strcmp(name, "ro.vendor.product.cpu.abi") == 0) { strcpy(value, "arm64-v8a"); return strlen(value); }
-    return orig_system_property_get ? orig_system_property_get(name, value) : 0;
-}
-
-static void hide_self_so() {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return;
-    char line[512];
-    unsigned long start, end;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "libkirin9000s_spoofer.so")) {
-            sscanf(line, "%lx-%lx", &start, &end);
-            size_t len = end - start;
-            mprotect((void*)(start & ~0xFFF), len + 0x1000, PROT_READ | PROT_WRITE);
-            for (char* p = (char*)start; p < (char*)end - 21; p++) {
-                if (memcmp(p, "libkirin9000s_spoofer", 21) == 0)
-                    memcpy(p, "libandroid_runtime.so", 21);
-            }
-            LOGD("[+] Hidden module from /proc/self/maps");
-            break;
-        }
-    }
-    fclose(fp);
 }
 
 class KirinSpoofModule : public ModuleBase {
 private:
     Api* api = nullptr;
     const char* module_path = "/data/adb/modules/kirin9000s_spoofer";
+    bool is_target = false;
 
 public:
     void onLoad(Api* api, JNIEnv* env) override {
         this->api = api;
-        LOGD("Kirin9000S Spoofer v3.0 loaded");
-        hide_self_so();
+        LOGD("Kirin9000S Spoofer loaded");
     }
 
     void preAppSpecialize(AppSpecializeArgs* args) override {
         const char* process = api->getProcessName();
-        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) return;
-
-        LOGD("=== Target detected: %s ===", process);
-
-        api->pltHookRegister(".*libc\\.so$", "getauxval", (void*)fake_getauxval, (void**)&orig_getauxval);
-        api->pltHookRegister(".*libc\\.so$", "__system_property_get", (void*)fake_system_property_get, (void**)&orig_system_property_get);
-        api->pltHookCommit();
-        LOGD("[+] PLT hooks installed");
-
-        char fake_cpuinfo[256], fake_midr[256], fake_version[256], fake_mountinfo[256];
-        char fake_socid[256], fake_stat[256], fake_kernel_max[256], fake_possible[256], fake_present[256];
-        snprintf(fake_cpuinfo, sizeof(fake_cpuinfo), "%s/cpuinfo", module_path);
-        snprintf(fake_midr, sizeof(fake_midr), "%s/midr_el1", module_path);
-        snprintf(fake_version, sizeof(fake_version), "%s/version", module_path);
-        snprintf(fake_mountinfo, sizeof(fake_mountinfo), "%s/mountinfo", module_path);
-        snprintf(fake_socid, sizeof(fake_socid), "%s/soc_id", module_path);
-        snprintf(fake_stat, sizeof(fake_stat), "%s/stat", module_path);
-        snprintf(fake_kernel_max, sizeof(fake_kernel_max), "%s/kernel_max", module_path);
-        snprintf(fake_possible, sizeof(fake_possible), "%s/possible", module_path);
-        snprintf(fake_present, sizeof(fake_present), "%s/present", module_path);
-
-        for (int i = 0; i < 10; i++) {
-            if (file_exists(fake_cpuinfo)) break;
-            usleep(50000);
+        LOGD("preAppSpecialize: %s", process);
+        
+        if (strcmp(process, "com.tencent.tmgp.dfm") == 0) {
+            is_target = true;
+            LOGD("*** TARGET DETECTED: %s ***", process);
+            
+            // 尝试挂载（在 zygote 阶段）
+            do_mount();
         }
-
-        bind_mount("/proc/cpuinfo", fake_cpuinfo);
-        bind_mount("/proc/version", fake_version);
-        bind_mount("/proc/self/mountinfo", fake_mountinfo);
-        bind_mount("/sys/devices/soc0/soc_id", fake_socid);
-        bind_mount("/proc/stat", fake_stat);
-        bind_mount("/sys/devices/system/cpu/kernel_max", fake_kernel_max);
-        bind_mount("/sys/devices/system/cpu/possible", fake_possible);
-        bind_mount("/sys/devices/system/cpu/present", fake_present);
-
-        if (file_exists("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")) {
-            bind_mount("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1", fake_midr);
-        }
-
-        for (int i = 0; i < 8; i++) {
-            char target[128], source[128];
-            snprintf(target, sizeof(target), "/sys/devices/system/cpu/cpu%d/online", i);
-            snprintf(source, sizeof(source), "%s/cpu%d/online", module_path, i);
-            if (file_exists(source)) bind_mount(target, source);
-        }
-
-        fix_file_times("/proc/cpuinfo");
-        fix_file_times("/proc/version");
-        fix_file_times("/proc/self/mountinfo");
-        fix_file_times("/proc/stat");
-
-        LOGD("[+] All fake files mounted and timestamps fixed");
     }
 
     void postAppSpecialize(const AppSpecializeArgs* args) override {
         const char* process = api->getProcessName();
-        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) return;
+        LOGD("postAppSpecialize: %s", process);
+        
+        if (!is_target) return;
+        
+        LOGD("*** POST SPECIALIZE: remounting for %s ***", process);
+        
+        // 再次挂载，确保对应用进程生效（关键！）
+        do_mount();
+        
+        // Hook getauxval（防止 HWCAP 泄露）
+        api->pltHookRegister(".*libc\\.so$", "getauxval", (void*)fake_getauxval, (void**)&orig_getauxval);
+        api->pltHookCommit();
+        
+        // 验证挂载是否成功
+        verify_mount();
+    }
 
+private:
+    void do_mount() {
         char fake_cpuinfo[256];
         snprintf(fake_cpuinfo, sizeof(fake_cpuinfo), "%s/cpuinfo", module_path);
-        if (file_exists(fake_cpuinfo)) {
-            mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr);
-            LOGD("[+] Re-mounted cpuinfo in postAppSpecialize");
+        
+        if (access(fake_cpuinfo, F_OK) != 0) {
+            LOGE("Fake cpuinfo not found: %s", fake_cpuinfo);
+            return;
         }
-        LOGD("=== Spoofing fully activated for %s ===", process);
+        
+        // 先尝试强制卸载已有挂载
+        umount2("/proc/cpuinfo", MNT_DETACH);
+        
+        // 绑定挂载
+        if (mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
+            LOGD("[+] Mount success: %s -> /proc/cpuinfo", fake_cpuinfo);
+        } else {
+            LOGE("[-] Mount failed: %s", strerror(errno));
+        }
+        
+        // 额外挂载 midr_el1（如果存在）
+        char fake_midr[256];
+        snprintf(fake_midr, sizeof(fake_midr), "%s/midr_el1", module_path);
+        const char* midr_target = "/sys/devices/system/cpu/cpu0/regs/identification/midr_el1";
+        if (access(fake_midr, F_OK) == 0 && access(midr_target, F_OK) == 0) {
+            mount(fake_midr, midr_target, nullptr, MS_BIND, nullptr);
+        }
+    }
+    
+    void verify_mount() {
+        FILE* fp = fopen("/proc/cpuinfo", "r");
+        if (!fp) {
+            LOGE("Cannot open /proc/cpuinfo for verification");
+            return;
+        }
+        
+        char line[256];
+        bool found = false;
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "Kirin 9000S")) {
+                found = true;
+                break;
+            }
+        }
+        fclose(fp);
+        
+        if (found) {
+            LOGD("*** VERIFICATION: /proc/cpuinfo shows Kirin 9000S ✅ ***");
+        } else {
+            LOGE("*** VERIFICATION: /proc/cpuinfo is NOT spoofed ❌ ***");
+            // 再次尝试挂载
+            do_mount();
+        }
     }
 };
 
