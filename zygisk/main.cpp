@@ -2,121 +2,103 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mount.h>
-#include <sys/stat.h>
+#include <sys/socket.h>
 #include <android/log.h>
 #include <cstring>
 #include <cstdio>
-#include <cerrno>
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Kirin9000S", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "Kirin9000S", __VA_ARGS__)
 
 using namespace zygisk;
 
-static unsigned long (*orig_getauxval)(unsigned long) = nullptr;
+// 完整的伪造 cpuinfo 内容（麒麟 9000S）
+static const char* FAKE_CPUINFO = 
+    "Processor\t: AArch64 Processor rev 0 (aarch64)\n"
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp\n"
+    "CPU implementer\t: 0x48\n"
+    "CPU architecture: 8\n"
+    "CPU variant\t: 0x1\n"
+    "CPU part\t: 0xd0c\n"
+    "CPU revision\t: 0\n"
+    "processor\t: 0\n"
+    "BogoMIPS\t: 26.00\n"
+    "CPU implementer\t: 0x48\n"
+    "CPU architecture: 8\n"
+    "CPU variant\t: 0x1\n"
+    "CPU part\t: 0xd0c\n"
+    "CPU revision\t: 0\n"
+    "Hardware\t: HiSilicon Kirin 9000S\n";
 
-static unsigned long fake_getauxval(unsigned long type) {
-    if (type == 16) return 0x7efefeff;   // AT_HWCAP
-    if (type == 26) return 0x0000001f;   // AT_HWCAP2
-    return orig_getauxval ? orig_getauxval(type) : 0;
+static int (*orig_open)(const char*, int, mode_t) = nullptr;
+static FILE* (*orig_fopen)(const char*, const char*) = nullptr;
+static ssize_t (*orig_read)(int, void*, size_t) = nullptr;
+static size_t (*orig_fread)(void*, size_t, size_t, FILE*) = nullptr;
+static char* (*orig_fgets)(char*, int, FILE*) = nullptr;
+
+// 拦截 open：返回一个包含假数据的 pipe fd
+static int fake_open(const char* path, int flags, mode_t mode) {
+    if (path && strstr(path, "/proc/cpuinfo")) {
+        LOGD("Intercepted open(%s)", path);
+        int pipefd[2];
+        if (pipe(pipefd) == 0) {
+            write(pipefd[1], FAKE_CPUINFO, strlen(FAKE_CPUINFO));
+            close(pipefd[1]);
+            return pipefd[0];
+        }
+        return -1;
+    }
+    return orig_open(path, flags, mode);
+}
+
+// 拦截 fopen：返回一个内存流
+static FILE* fake_fopen(const char* path, const char* mode) {
+    if (path && strstr(path, "/proc/cpuinfo")) {
+        LOGD("Intercepted fopen(%s)", path);
+        return fmemopen((void*)FAKE_CPUINFO, strlen(FAKE_CPUINFO), "r");
+    }
+    return orig_fopen(path, mode);
+}
+
+// 可选：拦截 fgets / fread（防止一些应用直接读 FILE*）
+static char* fake_fgets(char* buf, int size, FILE* fp) {
+    // 不做额外处理，因为 fmemopen 已经能正常工作
+    return orig_fgets(buf, size, fp);
+}
+
+static size_t fake_fread(void* ptr, size_t size, size_t nmemb, FILE* fp) {
+    return orig_fread(ptr, size, nmemb, fp);
 }
 
 class KirinSpoofModule : public ModuleBase {
 private:
     Api* api = nullptr;
-    const char* module_path = "/data/adb/modules/kirin9000s_spoofer";
-    bool is_target = false;
 
 public:
     void onLoad(Api* api, JNIEnv* env) override {
         this->api = api;
-        LOGD("Kirin9000S Spoofer loaded (Zygisk Next Edition)");
+        LOGD("Kirin9000S Spoofer loaded (Zygisk Next Hook Mode)");
     }
 
     void preAppSpecialize(AppSpecializeArgs* args) override {
-        const char* process = api->getProcessName();
-        LOGD("preAppSpecialize: %s", process);
-        
-        if (strcmp(process, "com.tencent.tmgp.dfm") == 0) {
-            is_target = true;
-            LOGD("*** TARGET DETECTED (pre): %s ***", process);
-        }
+        // Zygisk Next 下不在 pre 中做任何事
     }
 
     void postAppSpecialize(const AppSpecializeArgs* args) override {
         const char* process = api->getProcessName();
         LOGD("postAppSpecialize: %s", process);
         
-        if (!is_target) return;
+        if (strcmp(process, "com.tencent.tmgp.dfm") != 0) return;
         
-        LOGD("*** ZYGISK NEXT: Mounting in postAppSpecialize for %s ***", process);
+        LOGD("*** TARGET DETECTED: Installing hooks ***");
         
-        // 1. 执行挂载（Zygisk Next 要求在这里做）
-        do_mount();
-        
-        // 2. 安装 PLT hook
-        api->pltHookRegister(".*libc\\.so$", "getauxval", (void*)fake_getauxval, (void**)&orig_getauxval);
+        // 注册 PLT hooks
+        api->pltHookRegister(".*libc\\.so$", "open", (void*)fake_open, (void**)&orig_open);
+        api->pltHookRegister(".*libc\\.so$", "fopen", (void*)fake_fopen, (void**)&orig_fopen);
+        api->pltHookRegister(".*libc\\.so$", "fgets", (void*)fake_fgets, (void**)&orig_fgets);
+        api->pltHookRegister(".*libc\\.so$", "fread", (void*)fake_fread, (void**)&orig_fread);
         api->pltHookCommit();
         
-        // 3. 验证
-        verify_mount();
-        
-        LOGD("=== Spoofing active for %s ===", process);
-    }
-
-private:
-    void do_mount() {
-        char fake_cpuinfo[256];
-        snprintf(fake_cpuinfo, sizeof(fake_cpuinfo), "%s/cpuinfo", module_path);
-        
-        if (access(fake_cpuinfo, F_OK) != 0) {
-            LOGE("Fake cpuinfo not found: %s", fake_cpuinfo);
-            return;
-        }
-        
-        // 强制卸载旧挂载
-        umount2("/proc/cpuinfo", MNT_DETACH);
-        
-        // 绑定挂载
-        if (mount(fake_cpuinfo, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) == 0) {
-            LOGD("[+] Mount success: %s -> /proc/cpuinfo", fake_cpuinfo);
-        } else {
-            LOGE("[-] Mount failed: %s", strerror(errno));
-        }
-        
-        // 额外挂载 midr_el1（可选）
-        char fake_midr[256];
-        snprintf(fake_midr, sizeof(fake_midr), "%s/midr_el1", module_path);
-        const char* midr_target = "/sys/devices/system/cpu/cpu0/regs/identification/midr_el1";
-        if (access(fake_midr, F_OK) == 0 && access(midr_target, F_OK) == 0) {
-            mount(fake_midr, midr_target, nullptr, MS_BIND, nullptr);
-            LOGD("[+] Mount success: midr_el1");
-        }
-    }
-    
-    void verify_mount() {
-        FILE* fp = fopen("/proc/cpuinfo", "r");
-        if (!fp) {
-            LOGE("Cannot open /proc/cpuinfo for verification");
-            return;
-        }
-        
-        char line[256];
-        bool found = false;
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "Kirin 9000S")) {
-                found = true;
-                break;
-            }
-        }
-        fclose(fp);
-        
-        if (found) {
-            LOGD("✅ VERIFICATION: /proc/cpuinfo shows Kirin 9000S");
-        } else {
-            LOGE("❌ VERIFICATION FAILED: /proc/cpuinfo not spoofed");
-        }
+        LOGD("*** Hooks installed for %s ***", process);
     }
 };
 
