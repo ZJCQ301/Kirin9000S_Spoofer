@@ -6,13 +6,14 @@ FAKE_MIDR="$MODDIR/midr_el1"
 FAKE_VERSION="$MODDIR/version"
 FAKE_MOUNTINFO="$MODDIR/mountinfo"
 FAKE_SOCID="$MODDIR/soc_id"
+FAKE_STAT="$MODDIR/stat"
 
-# 生成随机 BogoMIPS 值（26~30 之间浮动，每次安装不同）
+# 生成随机 BogoMIPS 值（26~30 之间浮动）
 BOGO_BASE=$((26 + RANDOM % 5))
 BOGO_DEC=$((RANDOM % 99))
 BOGO_MIPS="$BOGO_BASE.$BOGO_DEC"
 
-# 写入伪造的 /proc/cpuinfo（动态 BogoMIPS）
+# 写入伪造的 /proc/cpuinfo
 cat > $FAKE_CPUINFO <<EOF
 Processor	: AArch64 Processor rev 0 (aarch64)
 Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp
@@ -92,12 +93,12 @@ EOF
 # midr_el1
 echo "0x480fd0c0" > $FAKE_MIDR
 
-# 伪造的内核版本（模拟麒麟9000S常见内核）
+# 伪造的内核版本
 cat > $FAKE_VERSION <<EOF
 Linux version 5.10.43-android12-9-g12345678-abcd1234 (build-user@build-host) (clang version 14.0.7, lld 14.0.7) #1 SMP PREEMPT Thu Jun 12 10:00:00 CST 2026
 EOF
 
-# 伪造的 mountinfo（只保留基础挂载，隐藏 bind mount）
+# 伪造的 mountinfo（隐藏 bind mount）
 cat > $FAKE_MOUNTINFO <<EOF
 20 0 0:1 / /proc rw,relatime - proc proc rw
 21 0 0:2 / /dev rw,relatime - tmpfs tmpfs rw
@@ -108,13 +109,52 @@ EOF
 # 伪造的 soc_id
 echo "Kirin9000S" > $FAKE_SOCID
 
-# 设置权限
-chmod 644 $FAKE_CPUINFO $FAKE_MIDR $FAKE_VERSION $FAKE_MOUNTINFO $FAKE_SOCID
+# 伪造的 /proc/stat (8核)
+cat > $FAKE_STAT <<EOF
+cpu  88786 0 25674 892056 3614 0 874 0 0 0
+cpu0 12345 0 3456 123456 567 0 123 0 0 0
+cpu1 12345 0 3456 123456 567 0 123 0 0 0
+cpu2 12345 0 3456 123456 567 0 123 0 0 0
+cpu3 12345 0 3456 123456 567 0 123 0 0 0
+cpu4 12345 0 3456 123456 567 0 123 0 0 0
+cpu5 12345 0 3456 123456 567 0 123 0 0 0
+cpu6 12345 0 3456 123456 567 0 123 0 0 0
+cpu7 12345 0 3456 123456 567 0 123 0 0 0
+intr 1023456 0 0 0 0 0 0 0 0 0
+ctxt 9876543
+btime 1600000000
+processes 123456
+procs_running 2
+procs_blocked 0
+softirq 654321 0 0 0 0 0 0 0 0 0
+EOF
 
-# 清理可能残留的旧挂载
+# 伪造 /sys/devices/system/cpu/ 下的核心数文件
+echo "0-7" > $MODDIR/kernel_max
+echo "0-7" > $MODDIR/possible
+echo "0-7" > $MODDIR/present
+echo "8" > $MODDIR/cpu_present
+echo "8" > $MODDIR/cpu_possible
+for i in 0 1 2 3 4 5 6 7; do
+    mkdir -p $MODDIR/cpu$i
+    echo "enabled" > $MODDIR/cpu$i/online
+done
+
+# 设置权限
+chmod 644 $FAKE_CPUINFO $FAKE_MIDR $FAKE_VERSION $FAKE_MOUNTINFO $FAKE_SOCID $FAKE_STAT
+chmod 644 $MODDIR/kernel_max $MODDIR/possible $MODDIR/present $MODDIR/cpu_present $MODDIR/cpu_possible
+for i in 0 1 2 3 4 5 6 7; do
+    chmod 644 $MODDIR/cpu$i/online
+done
+
+# 清理旧挂载
 umount /proc/cpuinfo 2>/dev/null
 umount /proc/version 2>/dev/null
 umount /proc/self/mountinfo 2>/dev/null
 umount /sys/devices/soc0/soc_id 2>/dev/null
+umount /proc/stat 2>/dev/null
+umount /sys/devices/system/cpu/kernel_max 2>/dev/null
+umount /sys/devices/system/cpu/possible 2>/dev/null
+umount /sys/devices/system/cpu/present 2>/dev/null
 
 exit 0
